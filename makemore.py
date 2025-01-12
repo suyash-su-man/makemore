@@ -26,7 +26,9 @@ from torch.nn import functional as F
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
 # -----------------------------------------------------------------------------
 
 @dataclass
@@ -70,7 +72,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-    def forward(self, x):
+    def forward(self, x, return_attn = False):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -85,10 +87,14 @@ class CausalSelfAttention(nn.Module):
         att = F.softmax(att, dim=-1)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
+        
         # output projection
         y = self.c_proj(y)
-        return y
+
+        if return_attn:
+            return y, att
+        else:
+            return y
 
 class Block(nn.Module):
     """ an unassuming Transformer block """
@@ -106,10 +112,22 @@ class Block(nn.Module):
         m = self.mlp
         self.mlpf = lambda x: m.c_proj(m.act(m.c_fc(x))) # MLP forward
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlpf(self.ln_2(x))
-        return x
+    # def forward(self, x):
+    #     x = x + self.attn(self.ln_1(x))
+    #     x = x + self.mlpf(self.ln_2(x))
+    #     return x
+
+    def forward(self, x, return_attn=False):
+        if return_attn:
+            out, attn_weights = self.attn(self.ln_1(x), return_attn=True)
+            x = x + out
+            x = x + self.mlpf(self.ln_2(x))
+            return x, attn_weights
+        else:
+            out = self.attn(self.ln_1(x))
+            x = x + out
+            x = x + self.mlpf(self.ln_2(x))
+            return x
 
 class Transformer(nn.Module):
     """ Transformer Language Model, exactly as seen in GPT-2 """
@@ -133,7 +151,7 @@ class Transformer(nn.Module):
     def get_block_size(self):
         return self.block_size
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, return_attn=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
@@ -143,8 +161,13 @@ class Transformer(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = tok_emb + pos_emb
+        all_attentions = []
         for block in self.transformer.h:
-            x = block(x)
+            if return_attn:
+                x, attn_weights = block(x, return_attn=True)
+                all_attentions.append(attn_weights)
+            else:
+                x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
@@ -153,7 +176,10 @@ class Transformer(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
-        return logits, loss
+        if return_attn:
+            return logits, loss, all_attentions
+        else:
+            return logits, loss
 
 # -----------------------------------------------------------------------------
 # Bag of Words (BoW) language model
@@ -425,6 +451,101 @@ class Bigram(nn.Module):
 # -----------------------------------------------------------------------------
 # helper functions for evaluating and sampling from the model
 
+def visualize_attention(attn_tensor, layer_idx, save_dir, step, batch_idx=0, head_idx=0, char_labels = None):
+    """
+    attn_tensor: torch.Tensor of shape (B, n_head, T, T)
+    layer_idx:   which layer we are visualizing (for title/label purposes)
+    batch_idx:   which example in the batch
+    head_idx:    which attention head to visualize
+    """
+
+    os.makedirs(save_dir, exist_ok=True)
+    # Move to CPU numpy
+    attn_matrix = attn_tensor[batch_idx, head_idx].cpu().numpy()  # shape: (T, T)
+    
+    T = attn_matrix.shape[0]
+    plt.figure(figsize=(5, 4))
+    sns.heatmap(attn_matrix, cmap="Blues", square=True)
+    plt.title(f"Layer {layer_idx}, Head {head_idx}, WordIdx {batch_idx}")
+
+    if char_labels is not None and len(char_labels) <= T:
+        plt.xticks(range(len(char_labels)), char_labels, rotation=45)
+        plt.yticks(range(len(char_labels)), char_labels, rotation=0)
+
+    plt.xlabel("Key positions")
+    plt.ylabel("Query positions")
+    plt.tight_layout()
+    word = ''.join(char_labels)
+    filename = f"layer_{layer_idx}_head_{head_idx}_{step}_{word}.png"
+    filepath = os.path.join(save_dir, filename)
+    plt.savefig(filepath, bbox_inches='tight')
+    print(f"Figure saved at {filepath}")
+
+
+def collect_attention_weights(dataset, model, device, block_size):
+    """
+    Collects attention weights for all words in the dataset, grouped by length.
+    Returns a dictionary with groups ('short', 'medium', 'long') and their attention data.
+    """
+    attention_data = {'short': [], 'medium': [], 'long': []}
+
+    for word in dataset.words:
+        length = len(word)
+        group = 'short' if length <= 4 else 'medium' if length <= 8 else 'long'
+
+        # Encode word and pad to block_size
+        encoded = dataset.encode(word)
+        X = torch.zeros(1, block_size, dtype=torch.long)
+        X[0, :len(encoded)] = encoded
+        X = X.to(device)
+
+        # Get attention weights
+        with torch.no_grad():
+            _, _, attentions = model(X, targets=None, return_attn=True)
+
+        # Save attention weights for all layers and heads
+        attention_data[group].append([att.cpu().numpy() for att in attentions])
+
+    return attention_data
+
+
+def compute_aggregates(attention_data):
+    """
+    Compute aggregate statistics (mean and variance) for attention data across groups.
+    """
+    aggregates = {}
+    for group, attentions in attention_data.items():
+        # Combine all attention matrices into a single numpy array
+        all_matrices = np.stack([np.stack(layer_attns) for layer_attns in attentions])
+        aggregates[group] = {
+            'mean': all_matrices.mean(axis=0),  # Average attention
+            'variance': all_matrices.var(axis=0)  # Variance of attention
+        }
+    return aggregates
+
+
+def visualize_attention_group(aggregates, group, layer, head, save_dir=None):
+    """
+    Visualize the aggregated attention (mean or variance) for a specific group, layer, and head.
+    """
+    mean_attention = aggregates[group]['mean'][layer, head]
+
+    # Plot heatmap
+    sns.heatmap(mean_attention, cmap="Blues", square=True)
+    plt.title(f"Group: {group}, Layer: {layer}, Head: {head}")
+    plt.xlabel("Key positions")
+    plt.ylabel("Query positions")
+
+    # Save or show
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"{group}_layer_{layer}_head_{head}.png")
+        plt.savefig(save_path, bbox_inches="tight")
+        print(f"Saved plot to {save_path}")
+    else:
+        plt.show()
+
+
 @torch.no_grad()
 def generate(model, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
     """
@@ -601,8 +722,8 @@ if __name__ == '__main__':
     parser.add_argument('--resume', action='store_true', help="when this flag is used, we will resume optimization from existing model in the workdir")
     parser.add_argument('--sample-only', action='store_true', help="just sample from the model and quit, don't train")
     parser.add_argument('--num-workers', '-n', type=int, default=4, help="number of data workers for both train/test")
-    parser.add_argument('--max-steps', type=int, default=-1, help="max number of optimization steps to run for, or -1 for infinite.")
-    parser.add_argument('--device', type=str, default='cpu', help="device to use for compute, examples: cpu|cuda|cuda:2|mps")
+    parser.add_argument('--max-steps', type=int, default=15001, help="max number of optimization steps to run for, or -1 for infinite.")
+    parser.add_argument('--device', type=str, default='cuda', help="device to use for compute, examples: cpu|cuda|cuda:2|mps")
     parser.add_argument('--seed', type=int, default=3407, help="seed")
     # sampling
     parser.add_argument('--top-k', type=int, default=-1, help="top-k for sampling, -1 means no top-k")
@@ -616,6 +737,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', '-b', type=int, default=32, help="batch size during optimization")
     parser.add_argument('--learning-rate', '-l', type=float, default=5e-4, help="learning rate")
     parser.add_argument('--weight-decay', '-w', type=float, default=0.01, help="weight decay")
+    parser.add_argument('--attention-data-dir', type=str, default="attention_data", help="folder to save attention data")
+    parser.add_argument('--save-plots-dir', type=str, default="attention_plots", help="folder to save attention plots")
     args = parser.parse_args()
     print(vars(args))
 
@@ -717,3 +840,52 @@ if __name__ == '__main__':
         if args.max_steps >= 0 and step >= args.max_steps:
             break
 
+        # After training: Extract some attention weights for inspection
+        steps = [1,15000]
+        if args.type == "transformer" and step in steps:
+            # Put model in eval mode, no gradients needed
+            model.eval()
+            # Categorize words from the dataset
+            # short_words = [w for w in train_dataset.words if len(w) <= 3]
+            # long_words = [w for w in train_dataset.words if len(w) >= 6]
+            # random_sample_common = train_dataset.words[:10]  # Example: first 10 words
+            # random_sample_rare = train_dataset.words[-10:]  # Example: last 10 words
+
+
+            
+            # Combine for testing
+            test_words = ["suyash", "llewellyn", "bartholomew", "jim"]
+
+            # visualising some test words
+            # define a words list and encode them
+            encoded_list = [train_dataset.encode(w) for w in test_words]
+
+            block_size = model.get_block_size()
+            max_len = max(len(enc) for enc in encoded_list)
+            assert max_len <= block_size, "Some word is longer than the model's block_size."
+            X_batch = torch.zeros(len(test_words), block_size, dtype=torch.long)
+
+            for i, enc in enumerate(encoded_list):
+                X_batch[i, :len(enc)] = enc
+            X_batch = X_batch.to(args.device)
+
+            with torch.no_grad():
+                logits, _, all_attentions = model(X_batch, targets=None, return_attn=True)
+
+            attention_dir = args.attention_data_dir
+            plot_atttn_dir = args.save_plots_dir
+            # Step 5: visualize
+            for layer_idx, attn_tensor in enumerate(all_attentions):
+                torch.save(attn_tensor.cpu(), os.path.join(attention_dir, f"attn_layer_{layer_idx}_{step}.pt"))
+                n_heads = attn_tensor.shape[1]
+                for batch_idx, word in enumerate(test_words):
+                    char_labels = list(word)
+                    for head_idx in range(n_heads):
+                        visualize_attention(
+                            attn_tensor, layer_idx, 
+                            plot_atttn_dir,
+                            step,
+                            batch_idx=batch_idx, 
+                            head_idx=head_idx,
+                            char_labels=char_labels
+                        )
