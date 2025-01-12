@@ -873,6 +873,7 @@ if __name__ == '__main__':
                 logits, _, all_attentions = model(X_batch, targets=None, return_attn=True)
 
             attention_dir = args.attention_data_dir
+            os.makedirs(attention_dir, exist_ok=True)
             plot_atttn_dir = args.save_plots_dir
             # Step 5: visualize
             for layer_idx, attn_tensor in enumerate(all_attentions):
